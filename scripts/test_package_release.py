@@ -36,7 +36,7 @@ class PackageReleaseTests(unittest.TestCase):
         return path
 
     def test_tar_package_is_deterministic_and_has_required_modes(self) -> None:
-        target = "x86_64-unknown-linux-gnu"
+        target = "x86_64-unknown-linux-musl"
         self.write_binary(target)
         archive, checksum = package_release.package_release(self.root, "v1.0.0", target, self.output)
         first_archive = archive.read_bytes()
@@ -81,12 +81,39 @@ class PackageReleaseTests(unittest.TestCase):
             )
 
     def test_tag_must_match_cargo_version(self) -> None:
-        target = "x86_64-unknown-linux-gnu"
+        target = "x86_64-unknown-linux-musl"
         self.write_binary(target)
         with self.assertRaises(package_release.ReleasePackagingError):
             package_release.package_release(self.root, "v1.0.1", target, self.output)
 
-    def test_verify_requires_exact_six_target_set_and_valid_checksums(self) -> None:
+    def test_verify_accepts_supported_subset_and_valid_checksums(self) -> None:
+        target = "x86_64-unknown-linux-musl"
+        self.write_binary(target)
+        package_release.package_release(self.root, "v1.0.0", target, self.output)
+
+        entries = package_release.verify_release_directory(self.root, "v1.0.0", self.output)
+        self.assertEqual(len(entries), 2)
+
+    def test_verify_rejects_orphaned_unknown_and_empty_sets(self) -> None:
+        self.output.mkdir(parents=True)
+        with self.assertRaises(package_release.ReleasePackagingError):
+            package_release.verify_release_directory(self.root, "v1.0.0", self.output)
+
+        target = "x86_64-unknown-linux-musl"
+        self.write_binary(target)
+        archive, checksum = package_release.package_release(
+            self.root, "v1.0.0", target, self.output
+        )
+        checksum.unlink()
+        with self.assertRaises(package_release.ReleasePackagingError):
+            package_release.verify_release_directory(self.root, "v1.0.0", self.output)
+
+        archive.unlink()
+        (self.output / "unknown.txt").write_text("unknown\n", encoding="utf-8")
+        with self.assertRaises(package_release.ReleasePackagingError):
+            package_release.verify_release_directory(self.root, "v1.0.0", self.output)
+
+    def test_verify_complete_set_detects_corrupt_archive(self) -> None:
         for target in package_release.TARGETS:
             self.write_binary(target)
             package_release.package_release(self.root, "v1.0.0", target, self.output)
@@ -95,7 +122,7 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertEqual(len(entries), 12)
 
         archive = self.output / package_release.archive_name(
-            "v1.0.0", "x86_64-unknown-linux-gnu"
+            "v1.0.0", "x86_64-unknown-linux-musl"
         )
         archive.write_bytes(archive.read_bytes() + b"corrupt")
         with self.assertRaises(package_release.ReleasePackagingError):

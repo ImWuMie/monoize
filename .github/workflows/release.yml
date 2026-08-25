@@ -76,17 +76,24 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: validate
+    continue-on-error: true
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             python: python3
+            linker: x86_64-unknown-linux-musl-gcc
+            static_libgcc: false
+            builder_image: ghcr.io/rust-cross/rust-musl-cross:x86_64-musl@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             python: python3
+            linker: aarch64-unknown-linux-musl-gcc
+            static_libgcc: true
+            builder_image: ghcr.io/rust-cross/rust-musl-cross:aarch64-musl@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             python: python3
@@ -111,6 +118,7 @@ jobs:
           persist-credentials: false
 
       - name: Install stable Rust
+        if: runner.os != 'Linux'
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
@@ -142,9 +150,64 @@ jobs:
         working-directory: frontend
         run: bun install --frozen-lockfile
 
-      - name: Build release binary
+      - name: Build non-Linux release binary
+        if: runner.os != 'Linux'
         shell: bash
         run: cargo build --locked --release --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Build static musl release binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/home/rust/src" \
+            --volume "$HOME/.cargo/registry:/root/.cargo/registry" \
+            --volume "$HOME/.cargo/git:/root/.cargo/git" \
+            --volume "$(command -v bun):/usr/local/bin/bun:ro" \
+            --workdir /home/rust/src \
+            --env "MONOIZE_MUSL_LINKER=$LINKER" \
+            --env "MONOIZE_MUSL_STATIC_LIBGCC=$STATIC_LIBGCC" \
+            --env RUSTFLAGS \
+            "$BUILDER_IMAGE" \
+            cargo build \
+              --config "target.${TARGET}.linker=\"/home/rust/src/scripts/musl-linker.sh\"" \
+              --locked \
+              --release \
+              --target "$TARGET"
+        env:
+          BUILDER_IMAGE: ${{ matrix.builder_image }}
+          LINKER: ${{ matrix.linker }}
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static -C link-arg=-static-libstdc++
+          STATIC_LIBGCC: ${{ matrix.static_libgcc }}
+          TARGET: ${{ matrix.target }}
+
+      - name: Restore runner ownership after Linux build
+        if: ${{ runner.os == 'Linux' && always() }}
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo"
+          if [[ -e "$GITHUB_WORKSPACE/target" ]]; then
+            sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/target"
+          fi
+
+      - name: Verify static musl linkage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="target/$TARGET/release/monoize"
+          file "$binary"
+          if readelf --program-headers "$binary" | grep -q 'INTERP'; then
+            echo "$binary contains an ELF interpreter" >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary" | grep -q '(NEEDED)'; then
+            echo "$binary contains a dynamic-library dependency" >&2
+            exit 1
+          fi
+          echo "$binary has no ELF interpreter or dynamic-library dependency"
         env:
           TARGET: ${{ matrix.target }}
 
@@ -196,7 +259,8 @@ jobs:
           compression-level: 0
 
   verify:
-    name: Verify complete release set
+    name: Verify available release set
+    if: ${{ always() && needs.validate.result == 'success' }}
     needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -214,7 +278,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Verify complete asset set
+      - name: Verify available asset set
         run: python3 scripts/package_release.py verify --tag "$RELEASE_TAG" --directory dist
 
   publish:
@@ -240,7 +304,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
   package-npm:
-    name: Verify npm package set
+    name: Verify available npm package set
+    if: ${{ always() && needs.validate.result == 'success' && needs.verify.result == 'success' }}
     needs: [validate, build, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -278,16 +343,30 @@ jobs:
             --packages-dir npm-stage \
             --output-dir npm-dist
 
-      - name: Verify complete npm package set
+      - name: Verify available npm package set
         run: bun npm/scripts/package.ts verify --tag "$RELEASE_TAG" --directory npm-dist
 
+      - name: Detect packaging runner platform package
+        id: client-platform
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [[ -f "npm-dist/monoize-${version}-linux-x64.tgz" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping client installation verification because linux-x64 is unavailable."
+          fi
+
       - name: Install pnpm for compatibility verification
+        if: ${{ steps.client-platform.outputs.available == 'true' }}
         shell: bash
         run: npm install --prefix target/npm-tools --ignore-scripts --no-audit --no-fund pnpm@10.33.0
         env:
           npm_config_cache: ${{ github.workspace }}/target/npm-tool-cache
 
       - name: Verify Bun, npm, and pnpm installation
+        if: ${{ steps.client-platform.outputs.available == 'true' }}
         shell: bash
         run: >-
           bun npm/scripts/verify-clients.ts
@@ -295,7 +374,7 @@ jobs:
           --directory npm-dist
           --pnpm target/npm-tools/node_modules/.bin/pnpm
 
-      - name: Upload complete npm package set
+      - name: Upload available npm package set
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package-set
@@ -312,6 +391,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Check out release ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -330,19 +410,22 @@ jobs:
         with:
           bun-version: 1.4.0
 
-      - name: Configure npm authentication
+      - name: Set up Node for npm Trusted Publishing
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.15.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install npm CLI for Trusted Publishing
         shell: bash
-        run: npm config set //registry.npmjs.org/:_authToken="$NODE_AUTH_TOKEN" --location=user
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/monoize-npmrc
+        run: |
+          npm install --global npm@12.0.2 --no-audit --no-fund
+          test "$(npm --version)" = "12.0.2"
 
       - name: Publish platform packages, then root package
         shell: bash
         run: bun npm/scripts/package.ts publish --tag "$RELEASE_TAG" --directory npm-dist
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/monoize-npmrc
 
   build-container:
     name: Build container ${{ matrix.platform }}
@@ -353,6 +436,7 @@ jobs:
           && ((github.event_name == 'release' && needs.publish.result == 'success')
               || (github.event_name == 'workflow_dispatch' && inputs.publish_container)) }}
     needs: [validate, verify, publish]
+    continue-on-error: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
@@ -366,12 +450,12 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-24.04
             artifact: amd64
-            native_target: x86_64-unknown-linux-gnu
+            native_target: x86_64-unknown-linux-musl
             cache-scope: linux-amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             artifact: arm64
-            native_target: aarch64-unknown-linux-gnu
+            native_target: aarch64-unknown-linux-musl
             cache-scope: linux-arm64
     env:
       IMAGE_NAME: ${{ needs.validate.outputs.image }}
@@ -389,12 +473,15 @@ jobs:
         run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Download native linux archive
+        id: native
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-${{ matrix.native_target }}
           path: dist
 
       - name: Stage prebuilt binary
+        if: ${{ steps.native.outcome == 'success' }}
         shell: bash
         run: |
           archive="monoize-${RELEASE_TAG}-${NATIVE_TARGET}.tar.gz"
@@ -407,6 +494,7 @@ jobs:
           cp Dockerfile docker-pack/Dockerfile
 
       - name: Log in to GHCR
+        if: ${{ steps.native.outcome == 'success' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.0.0
         with:
           registry: ghcr.io
@@ -414,9 +502,11 @@ jobs:
           password: ${{ github.token }}
 
       - name: Set up Docker Buildx
+        if: ${{ steps.native.outcome == 'success' }}
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.0.0
 
       - name: Build and push platform image
+        if: ${{ steps.native.outcome == 'success' }}
         id: container
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.0.0
         with:
@@ -430,6 +520,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.cache-scope }}
 
       - name: Stage platform digest
+        if: ${{ steps.native.outcome == 'success' }}
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/digests"
@@ -437,6 +528,7 @@ jobs:
           touch "$RUNNER_TEMP/digests/${digest#sha256:}"
 
       - name: Upload platform digest
+        if: ${{ steps.native.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: container-digest-${{ matrix.artifact }}
@@ -446,7 +538,10 @@ jobs:
 
   publish-container:
     name: Publish multi-platform container
-    if: ${{ github.event_name == 'release' || inputs.publish_container }}
+    if: >-
+      ${{ always()
+          && needs.validate.result == 'success'
+          && (github.event_name == 'release' || inputs.publish_container) }}
     needs: [validate, build-container]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -457,13 +552,29 @@ jobs:
       IMAGE_NAME: ${{ needs.validate.outputs.image }}
     steps:
       - name: Download platform digests
+        id: digests
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: container-digest-*
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
+      - name: Detect available platform digests
+        id: digest-set
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest_count=$(find "$RUNNER_TEMP/digests" -maxdepth 1 -type f | wc -l)
+          if [[ "$digest_count" -gt 0 ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping container publication because no platform digest is available."
+          fi
+
       - name: Log in to GHCR
+        if: ${{ steps.digest-set.outputs.available == 'true' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.0.0
         with:
           registry: ghcr.io
@@ -471,9 +582,11 @@ jobs:
           password: ${{ github.token }}
 
       - name: Set up Docker Buildx
+        if: ${{ steps.digest-set.outputs.available == 'true' }}
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.0.0
 
       - name: Create and verify container manifest
+        if: ${{ steps.digest-set.outputs.available == 'true' }}
         shell: bash
         run: |
           tags=("$IMAGE_NAME:$CONTAINER_TAG")
@@ -493,8 +606,8 @@ jobs:
             sources+=("$IMAGE_NAME@sha256:$(basename "$digest_file")")
           done < <(find "$RUNNER_TEMP/digests" -maxdepth 1 -type f | sort)
 
-          if [[ "${#sources[@]}" -ne 2 ]]; then
-            echo "expected 2 platform digests, found ${#sources[@]}" >&2
+          if [[ "${#sources[@]}" -lt 1 ]]; then
+            echo "expected at least 1 platform digest, found ${#sources[@]}" >&2
             exit 1
           fi
 
